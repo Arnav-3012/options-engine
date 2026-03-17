@@ -2,7 +2,7 @@
 ### GBM + Monte Carlo Simulation for Indian Equity Markets
 
 **STPA College Project — Stochastic Processes**
-**Presentation: April 9–10, 2026**
+
 
 ---
 
