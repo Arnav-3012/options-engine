@@ -2,6 +2,7 @@
 dashboard/app.py
 ----------------
 Full four-tab Streamlit dashboard for the Options Pricing Engine.
+Includes live RELIANCE.NS price feed, intraday chart, and auto-refresh.
 
 Tabs:
     1. Pricing & Greeks  — summary table, metric cards, Greek charts, payoff diagram
@@ -16,11 +17,14 @@ Run with:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import time
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.stats import lognorm, norm
+import yfinance as yf
+from scipy.stats import lognorm
+from datetime import datetime
 
 from models.black_scholes import black_scholes
 from models.greeks import greeks, greeks_vs_spot
@@ -28,17 +32,17 @@ from models.gbm import simulate_gbm, terminal_prices
 from models.monte_carlo import mc_price, mc_antithetic
 from analysis.convergence import run_convergence, variance_reduction_ratio, PATH_COUNTS
 from data.nse_options import fetch_option_chain
+from data.fetch_data import fetch_price_history, calibrate_params
 from analysis.vol_smile import compute_vol_smile
-from datetime import datetime
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-CAL_SIGMA   = 0.2107
-CAL_S0      = 1380.70
-CAL_MU      = -0.0176
-CAL_R       = 0.065
-VAR_RED     = 2.19
-ATM_IV      = 22.50
-OTM_PUT_IV  = 91.20
+CAL_SIGMA    = 0.2107
+CAL_S0       = 1380.70
+CAL_MU       = -0.0176
+CAL_R        = 0.065
+VAR_RED      = 2.19
+ATM_IV       = 22.50
+OTM_PUT_IV   = 91.20
 SMILE_SPREAD = 68.70
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -46,22 +50,151 @@ st.set_page_config(page_title="Options Pricing Engine", page_icon="📈", layout
 st.title("📈 Options Pricing Engine — GBM + Monte Carlo")
 st.caption("RELIANCE.NS · STPA College Project · Antithetic Variance Reduction + Volatility Smile")
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE FEED CACHED FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live_price() -> dict:
+    """
+    Fetch current RELIANCE.NS price from yfinance (15-min delay for free feed).
+    Cached for 60 seconds. Falls back to CAL_S0 silently on any error.
+
+    Returns dict with keys: price, prev_close, change, change_pct, timestamp, success.
+    """
+    try:
+        info       = yf.Ticker("RELIANCE.NS").fast_info
+        price      = float(info.last_price)
+        prev_close = float(info.previous_close)
+        change     = price - prev_close
+        change_pct = change / prev_close * 100 if prev_close else 0.0
+        return {
+            "price":      price,
+            "prev_close": prev_close,
+            "change":     change,
+            "change_pct": change_pct,
+            "timestamp":  datetime.now().strftime("%H:%M:%S"),
+            "success":    True,
+        }
+    except Exception:
+        return {
+            "price":      CAL_S0,
+            "prev_close": CAL_S0,
+            "change":     0.0,
+            "change_pct": 0.0,
+            "timestamp":  "—",
+            "success":    False,
+        }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday() -> pd.DataFrame:
+    """
+    Fetch 1-minute intraday close prices for RELIANCE.NS for today.
+    Cached for 5 minutes. Returns empty DataFrame on failure.
+    """
+    try:
+        df = yf.download(
+            "RELIANCE.NS", period="1d", interval="1m",
+            progress=False, multi_level_index=False,
+        )
+        if df.empty:
+            return pd.DataFrame()
+        return df[["Close"]].dropna()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_live_sigma() -> dict:
+    """
+    Recalibrate sigma and mu from fresh 2-year RELIANCE.NS data.
+    Cached for 1 hour — sigma doesn't change minute to minute.
+
+    Returns dict with keys: sigma, mu, last_price, n_days, success.
+    """
+    try:
+        prices = fetch_price_history("RELIANCE.NS", period_years=2)
+        params = calibrate_params(prices)
+        params["success"] = True
+        return params
+    except Exception:
+        return {
+            "sigma":      CAL_SIGMA,
+            "mu":         CAL_MU,
+            "last_price": CAL_S0,
+            "n_days":     0,
+            "success":    False,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE INITIALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+if "live_price_data"   not in st.session_state:
+    st.session_state.live_price_data   = None
+if "live_sigma_data"   not in st.session_state:
+    st.session_state.live_sigma_data   = None
+if "last_auto_refresh" not in st.session_state:
+    st.session_state.last_auto_refresh = time.time()
+if "s0_override"       not in st.session_state:
+    st.session_state.s0_override       = None
+if "sigma_override"    not in st.session_state:
+    st.session_state.sigma_override    = None
+
+# ── Convenience aliases ────────────────────────────────────────────────────────
+live_price_data = st.session_state.live_price_data
+live_sigma_data = st.session_state.live_sigma_data
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
+
+    # ── Live Feed section ──────────────────────────────────────────────────────
+    st.header("📡 Live Feed")
+    auto_refresh = st.toggle("Auto-refresh price", value=False)
+
+    refresh_interval = 60
+    if auto_refresh:
+        refresh_interval = st.selectbox(
+            "Refresh interval (seconds)", [30, 60, 120, 300], index=1
+        )
+        elapsed   = time.time() - st.session_state.last_auto_refresh
+        remaining = max(0, int(refresh_interval - elapsed))
+        st.caption(f"Next refresh in {remaining}s")
+
+    st.divider()
+
+    # ── Parameter sliders ──────────────────────────────────────────────────────
     st.header("Parameters")
-    S0        = st.slider("Stock Price S0 (₹)",     500,  2500, 1380, 10)
-    K         = st.slider("Strike Price K (₹)",      500,  2500, 1400, 10)
-    T_days    = st.slider("Time to Expiry (days)",     1,   365,   30,  1)
-    sigma_pct = st.slider("Volatility σ (%)",          5,   100,   21,  1)
-    r_pct     = st.slider("Risk-free Rate r (%)",      1,    15,    7,  1)
-    N_paths   = st.slider("Simulation Paths N",     1000, 20000, 10000, 500)
+
+    s0_default    = max(500,  min(2500, int(st.session_state.s0_override)))    \
+                    if st.session_state.s0_override    is not None else 1380
+    sigma_default = max(5,    min(100,  int(st.session_state.sigma_override))) \
+                    if st.session_state.sigma_override is not None else 21
+
+    S0        = st.slider("Stock Price S0 (₹)",      500,  2500, s0_default,    10)
+    K         = st.slider("Strike Price K (₹)",       500,  2500, 1400,          10)
+    T_days    = st.slider("Time to Expiry (days)",      1,   365,   30,           1)
+    sigma_pct = st.slider("Volatility σ (%)",           5,   100, sigma_default,  1)
+    r_pct     = st.slider("Risk-free Rate r (%)",       1,    15,    7,           1)
+    N_paths   = st.slider("Simulation Paths N",      1000, 20000, 10000,        500)
     option_type = st.radio("Option Type", ["call", "put"], index=0)
 
     st.divider()
+
+    # ── Calibration stats ──────────────────────────────────────────────────────
     st.markdown("**Calibrated (RELIANCE.NS)**")
-    st.caption(f"σ = {CAL_SIGMA*100:.2f}%")
-    st.caption(f"S0 = ₹{CAL_S0:,.2f}")
-    st.caption(f"μ = {CAL_MU*100:.2f}%")
+    if live_sigma_data and live_sigma_data["success"]:
+        st.caption(f"σ = {live_sigma_data['sigma']*100:.2f}%  ⬅ LIVE")
+        st.caption(f"μ = {live_sigma_data['mu']*100:.2f}%  ⬅ LIVE")
+        st.caption(f"S0 = ₹{live_sigma_data['last_price']:,.2f}  ⬅ LIVE")
+        st.caption(f"({live_sigma_data['n_days']} trading days)")
+    else:
+        st.caption(f"σ = {CAL_SIGMA*100:.2f}%  (cached)")
+        st.caption(f"S0 = ₹{CAL_S0:,.2f}  (cached)")
+        st.caption(f"μ = {CAL_MU*100:.2f}%  (cached)")
     st.caption(f"Variance reduction = {VAR_RED}x")
     st.caption(f"ATM implied vol = {ATM_IV}%")
 
@@ -70,11 +203,18 @@ T     = T_days / 365
 sigma = sigma_pct / 100
 r     = r_pct / 100
 
-# ── Pre-compute prices + Greeks (used across tabs) ─────────────────────────────
-call_bs   = black_scholes(S0, K, T, r, sigma, "call")
-put_bs    = black_scholes(S0, K, T, r, sigma, "put")
-g         = greeks(S0, K, T, r, sigma, option_type)
-mc_result = mc_price(S0, K, T, r, sigma, N_paths, option_type, seed=42)
+# active_sigma: use live-recalibrated value only if user clicked "Recalibrate σ"
+active_sigma = (
+    live_sigma_data["sigma"]
+    if (live_sigma_data and live_sigma_data["success"] and st.session_state.sigma_override is not None)
+    else sigma
+)
+
+# ── Pre-compute prices + Greeks (uses active_sigma) ────────────────────────────
+call_bs   = black_scholes(S0, K, T, r, active_sigma, "call")
+put_bs    = black_scholes(S0, K, T, r, active_sigma, "put")
+g         = greeks(S0, K, T, r, active_sigma, option_type)
+mc_result = mc_price(S0, K, T, r, active_sigma, N_paths, option_type, seed=42)
 pct_err   = abs(mc_result["price"] - call_bs["price"]) / call_bs["price"] * 100
 
 # ── Cached heavy computations ──────────────────────────────────────────────────
@@ -93,8 +233,131 @@ def cached_smile():
         calls_smile = compute_vol_smile(calls_raw, spot, CAL_R, T_exp, "call")
         puts_smile  = compute_vol_smile(puts_raw,  spot, CAL_R, T_exp, "put")
         return calls_smile, puts_smile, ticker, expiry, spot, T_exp
-    except Exception as e:
+    except Exception:
         return None, None, "N/A", "N/A", CAL_S0, 30/365
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TICKER BAR
+# ══════════════════════════════════════════════════════════════════════════════
+tb1, tb2, tb3, tb4, tb5 = st.columns([1.2, 1.4, 1.6, 2, 1.8])
+
+with tb1:
+    if st.button("🔄 Fetch Live Price", use_container_width=True):
+        fetch_live_price.clear()
+        fetch_intraday.clear()
+        result = fetch_live_price()
+        st.session_state.live_price_data = result
+        st.session_state.last_auto_refresh = time.time()
+        st.rerun()
+
+with tb2:
+    if st.button("📐 Sync S0 to Live Price", use_container_width=True):
+        if live_price_data and live_price_data["success"]:
+            st.session_state.s0_override = int(live_price_data["price"])
+            st.rerun()
+        else:
+            st.toast("Fetch live price first.", icon="⚠️")
+
+with tb3:
+    if st.button("📊 Recalibrate σ (live data)", use_container_width=True):
+        fetch_live_sigma.clear()
+        result = fetch_live_sigma()
+        st.session_state.live_sigma_data = result
+        live_sigma_data = result
+        if result["success"]:
+            st.session_state.sigma_override = int(result["sigma"] * 100)
+        st.rerun()
+
+with tb4:
+    if live_price_data and live_price_data["success"]:
+        price  = live_price_data["price"]
+        chg    = live_price_data["change"]
+        chg_p  = live_price_data["change_pct"]
+        colour = "#00CC96" if chg >= 0 else "#EF553B"
+        arrow  = "▲" if chg >= 0 else "▼"
+        st.markdown(
+            f"""<div style="padding:6px 0;">
+                <span style="font-size:22px; font-weight:700; color:{colour};">
+                    ₹{price:,.2f}
+                </span>&nbsp;&nbsp;
+                <span style="font-size:14px; color:{colour};">
+                    {arrow} ₹{abs(chg):.2f} ({chg_p:+.2f}%)
+                </span>
+                <div style="font-size:11px; color:#888;">RELIANCE.NS · 15-min delay</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""<div style="padding:6px 0;">
+                <span style="font-size:18px; color:#888;">₹{CAL_S0:,.2f}</span>
+                <div style="font-size:11px; color:#888;">No live data — using calibrated S0</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+with tb5:
+    if live_price_data and live_price_data["success"]:
+        st.markdown(
+            f"""<div style="padding:6px 0; font-size:12px; color:#aaa;">
+                🟢 Live (15-min delay)<br>
+                Last fetch: {live_price_data['timestamp']}
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    elif live_price_data and not live_price_data["success"]:
+        st.markdown(
+            """<div style="padding:6px 0; font-size:12px; color:#EF553B;">
+                ⚠ Fetch failed<br>Using fallback S0
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """<div style="padding:6px 0; font-size:12px; color:#888;">
+                — Not fetched yet<br>Click 🔄 to load
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTRADAY CHART EXPANDER
+# ══════════════════════════════════════════════════════════════════════════════
+if live_price_data and live_price_data["success"]:
+    with st.expander("📈 Today's Intraday Price Chart"):
+        intraday_df = fetch_intraday()
+        if intraday_df.empty:
+            st.info("Intraday data unavailable — market may be closed or outside 9:15 AM – 3:30 PM IST.")
+        else:
+            prev_close = live_price_data["prev_close"]
+            last_price = float(intraday_df["Close"].iloc[-1])
+            line_colour = "#00CC96" if last_price >= prev_close else "#EF553B"
+
+            fig_intra = go.Figure()
+            fig_intra.add_trace(go.Scatter(
+                x=intraday_df.index,
+                y=intraday_df["Close"],
+                mode="lines",
+                line=dict(color=line_colour, width=1.8),
+                name="RELIANCE.NS",
+            ))
+            fig_intra.add_hline(
+                y=prev_close,
+                line_dash="dot", line_color="white", line_width=1,
+                annotation_text=f"  Prev close ₹{prev_close:,.2f}",
+                annotation_position="right",
+                annotation_font=dict(color="white", size=10),
+            )
+            fig_intra.update_layout(
+                title=dict(text="RELIANCE.NS — Today (1-min intervals)", x=0.5),
+                xaxis_title="Time", yaxis_title="Price (₹)",
+                template="plotly_dark", height=300,
+                margin=dict(l=50, r=20, t=50, b=40),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_intra, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -157,7 +420,7 @@ with tab1:
 
     # ── Greeks charts ──────────────────────────────────────────────────────────
     st.subheader(f"Greeks vs Stock Price  ({option_type.upper()}, K=₹{K}, T={T_days}d, σ={sigma_pct}%)")
-    gdf = greeks_vs_spot(K, T, r, sigma, option_type)
+    gdf = greeks_vs_spot(K, T, r, active_sigma, option_type)
 
     GREEK_CFG = [
         ("delta", "Delta (Δ)", "₹ per ₹1 move",   "#636EFA"),
@@ -217,7 +480,7 @@ with tab1:
 
     st.caption(
         f"d₁={call_bs['d1']:.4f}  |  d₂={call_bs['d2']:.4f}  |  "
-        f"T={T:.4f}yr  |  σ={sigma:.4f}  |  r={r:.4f}"
+        f"T={T:.4f}yr  |  σ={active_sigma:.4f}  |  r={r:.4f}"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -227,8 +490,8 @@ with tab2:
 
     # ── Path fan chart ─────────────────────────────────────────────────────────
     st.subheader("GBM Price Path Simulation")
-    n_steps  = T_days
-    all_paths = simulate_gbm(S0, r, sigma, T, n_steps, N_paths, seed=7)
+    n_steps   = T_days
+    all_paths = simulate_gbm(S0, r, active_sigma, T, n_steps, N_paths, seed=7)
 
     time_axis = np.arange(n_steps + 1)
     p5  = np.percentile(all_paths, 5,  axis=1)
@@ -278,11 +541,11 @@ with tab2:
     prob_itm_put  = float(np.mean(S_T < K))
 
     # Log-normal PDF overlay
-    mu_ln  = np.log(S0) + (r - 0.5 * sigma ** 2) * T
-    sig_ln = sigma * np.sqrt(T)
+    mu_ln  = np.log(S0) + (r - 0.5 * active_sigma ** 2) * T
+    sig_ln = active_sigma * np.sqrt(T)
     x_pdf  = np.linspace(S_T.min(), S_T.max(), 300)
     y_pdf  = lognorm.pdf(x_pdf, s=sig_ln, scale=np.exp(mu_ln))
-    scale_factor = len(S_T) * (S_T.max() - S_T.min()) / 80   # match histogram bin height
+    scale_factor = len(S_T) * (S_T.max() - S_T.min()) / 80
 
     fig_hist = go.Figure()
 
@@ -592,3 +855,21 @@ dv = κ(θ − v) dt + ξ√v dW₂        (v = variance, mean-reverts to θ)
 This produces a natural volatility smile and is the industry standard at derivatives desks
 at JP Morgan, Goldman Sachs, and Citadel. It would be the direct next step for this project.
         """)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-REFRESH COUNTDOWN (only runs when toggle is ON)
+# ══════════════════════════════════════════════════════════════════════════════
+if auto_refresh:
+    elapsed = time.time() - st.session_state.last_auto_refresh
+    if elapsed >= refresh_interval:
+        fetch_live_price.clear()
+        fetch_intraday.clear()
+        result = fetch_live_price()
+        st.session_state.live_price_data = result
+        if result["success"]:
+            st.session_state.s0_override = int(result["price"])
+        st.session_state.last_auto_refresh = time.time()
+        st.rerun()
+    else:
+        time.sleep(1)
+        st.rerun()
