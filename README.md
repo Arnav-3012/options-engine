@@ -196,4 +196,3 @@ Implied volatility back-solved from real option chain data reveals a pronounced 
 
 ---
 
-*Built with Claude Code · STPA · 2026*
