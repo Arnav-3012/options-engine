@@ -227,11 +227,20 @@ def cached_convergence():
 @st.cache_data(show_spinner="Fetching option chain …")
 def cached_smile():
     try:
-        calls_raw, puts_raw, ticker, expiry, spot = fetch_option_chain("RELIANCE.NS", 0)
-        days = (datetime.strptime(expiry, "%Y-%m-%d") - datetime.today()).days
-        T_exp = max(days, 1) / 365
+        # Try expiry indices 0, 1, 2 — skip any expiry that is today or
+        # has fewer than 3 calendar days remaining (IV solver breaks near T=0)
+        MIN_DAYS = 3
+        for idx in range(3):
+            calls_raw, puts_raw, ticker, expiry, spot = fetch_option_chain("RELIANCE.NS", idx)
+            days = (datetime.strptime(expiry, "%Y-%m-%d") - datetime.today()).days
+            if days >= MIN_DAYS:
+                break
+        T_exp = max(days, MIN_DAYS) / 365
         calls_smile = compute_vol_smile(calls_raw, spot, CAL_R, T_exp, "call")
         puts_smile  = compute_vol_smile(puts_raw,  spot, CAL_R, T_exp, "put")
+        # If both come back empty, the smile failed — return None to show warning
+        if calls_smile.empty and puts_smile.empty:
+            return None, None, "N/A", "N/A", CAL_S0, 30/365
         return calls_smile, puts_smile, ticker, expiry, spot, T_exp
     except Exception:
         return None, None, "N/A", "N/A", CAL_S0, 30/365
